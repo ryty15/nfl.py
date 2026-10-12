@@ -5,8 +5,8 @@ from sklearn.linear_model import LinearRegression
 # ----------------------------
 # Load 2025 play-by-play & player stats
 # ----------------------------
-pbp_25 = nfl.load_pbp(2025).to_pandas()
-player_25 = nfl.load_player_stats(2025).to_pandas()
+pbp_25 = nfl.load_pbp(2026).to_pandas()
+player_25 = nfl.load_player_stats(2026).to_pandas()
 
 # ----------------------------
 # Merge passer info into play-by-play
