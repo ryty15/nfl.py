@@ -1,0 +1,1403 @@
+
+import nflreadpy as nfl
+import pandas as pd
+import numpy as np
+from sklearn.linear_model import LinearRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.neighbors import NearestNeighbors
+from sklearn.ensemble import HistGradientBoostingRegressor
+# --------------------------------------------------
+# 1. LOAD HISTORICAL PLAY-BY-PLAY DATA
+# --------------------------------------------------
+
+SEASONS = list(range(2024, 2027))
+
+
+pbp = nfl.load_pbp(seasons=SEASONS).to_pandas()
+
+# Keep only regular-season plays with valid teams.
+pbp = pbp[
+    (pbp["season_type"] == "REG") &
+    pbp["posteam"].notna() &
+    pbp["defteam"].notna()
+].copy()
+
+# Keep only the columns needed by the rest of the script.
+needed_cols = [
+    "season", "week", "game_id", "season_type",
+    "posteam", "defteam", "home_team", "play_id",
+    "play_type", "qb_kneel", "qb_spike", "play_deleted",
+    "epa", "yards_gained", "success",
+    "pass_attempt", "rush_attempt", "complete_pass",
+    "pass_touchdown", "interception", "sack",
+    "passing_yards", "rushing_yards", "rush_touchdown",
+    "passer_player_id", "passer_player_name",
+    "rusher_player_id"
+]
+
+pbp = pbp[needed_cols].copy()
+
+pbp = pbp.sort_values(
+    ["season", "week", "game_id"]
+).reset_index(drop=True)
+
+print("Rows:", len(pbp), flush=True)
+print("Seasons:", sorted(pbp["season"].unique()), flush=True)
+print("Columns retained:", len(pbp.columns), flush=True)
+
+
+
+
+# --------------------------------------------------
+# 2. CREATE TEAM-GAME STATISTICS
+# --------------------------------------------------
+
+# Use plays that can contribute to offensive performance.
+plays = pbp[
+    (pbp["play_type"].isin(["pass", "run"])) &
+    (pbp["qb_kneel"] != 1) &
+    (pbp["qb_spike"] != 1) &
+    (pbp["play_deleted"] != 1)
+].copy()
+
+# Ensure numeric columns are usable.
+for col in ["epa", "yards_gained", "success",
+            "pass_attempt", "rush_attempt",
+            "complete_pass", "pass_touchdown",
+            "interception", "rushing_yards",
+            "passing_yards", "rush_touchdown"]:
+    plays[col] = pd.to_numeric(
+        plays[col], errors="coerce"
+    )
+
+# Aggregate each offense's performance in each game.
+
+# Create separate columns for pass and rush EPA
+plays["pass_epa"] = plays["epa"].where(
+    plays["play_type"] == "pass"
+)
+plays["rush_epa"] = plays["epa"].where(
+    plays["play_type"] == "run"
+)
+
+# Aggregate each offense's performance in each game
+team_offense = (
+    plays.groupby(
+        ["season", "week", "game_id", "posteam", "defteam"],
+        as_index=False
+    )
+    .agg(
+        offensive_epa=("epa", "mean"),
+        offensive_success=("success", "mean"),
+        offensive_yards_per_play=("yards_gained", "mean"),
+        offensive_pass_epa=("pass_epa", "mean"),
+        offensive_rush_epa=("rush_epa", "mean"),
+        plays=("play_id", "count")
+    )
+    .rename(columns={
+        "posteam": "team",
+        "defteam": "opponent"
+    })
+)
+
+#print(team_offense.head())
+
+
+
+# --------------------------------------------------
+# 3. CREATE QUARTERBACK GAME STATS
+# --------------------------------------------------
+
+qb_plays = plays[
+    plays["passer_player_id"].notna()
+].copy()
+
+# A quarterback can have multiple play rows per game.
+qb_passing = (
+    qb_plays.groupby(
+        ["season", "week", "game_id",
+         "posteam", "defteam",
+         "passer_player_id", "passer_player_name"],
+        as_index=False
+    )
+    .agg(
+        attempts=("pass_attempt", "sum"),
+        completions=("complete_pass", "sum"),
+        passing_yards=("passing_yards", "sum"),
+        passing_tds=("pass_touchdown", "sum"),
+        interceptions=("interception", "sum"),
+        sacks=("sack", "sum"),
+        passing_epa=("epa", "mean")
+    )
+)
+
+# Rushing production for quarterbacks.
+# Scrambles are associated with the QB in rusher_player_id.
+qb_rush_plays = plays[
+    plays["rusher_player_id"].notna()
+].copy()
+
+qb_rushing = (
+    qb_rush_plays.groupby(
+        ["season", "week", "game_id",
+         "posteam", "rusher_player_id"],
+        as_index=False
+    )
+    .agg(
+        rushing_attempts=("rush_attempt", "sum"),
+        rushing_yards=("rushing_yards", "sum"),
+        rushing_tds=("rush_touchdown", "sum")
+    )
+    .rename(columns={
+        "rusher_player_id": "passer_player_id"
+    })
+)
+
+qb_games = qb_passing.merge(
+    qb_rushing,
+    on=["season", "week", "game_id",
+        "posteam", "passer_player_id"],
+    how="left"
+)
+
+for col in [
+    "rushing_attempts", "rushing_yards", "rushing_tds"
+]:
+    qb_games[col] = qb_games[col].fillna(0)
+
+qb_games = qb_games.rename(columns={
+    "posteam": "team",
+    "defteam": "opponent",
+    "passer_player_id": "qb_id",
+    "passer_player_name": "qb_name"
+})
+
+print(qb_games.head())
+# Check the QB game-level dataset
+print("\nQB game stats:")
+print(qb_games.head(10).to_string(index=False))
+
+print("\nNumber of QB game rows:", len(qb_games))
+print("\nMissing values:")
+print(qb_games[
+    ["attempts", "completions", "passing_yards",
+     "passing_tds", "interceptions", "rushing_yards"]
+].isna().sum())
+
+# Check whether QB rushing stats were merged successfully
+print("\nQB rushing production:")
+print(
+    qb_games[
+        ["qb_name", "rushing_attempts",
+         "rushing_yards", "rushing_tds"]
+    ].head(10).to_string(index=False)
+)
+
+
+# --------------------------------------------------
+# 4. BUILD PREGAME TEAM RATINGS
+# --------------------------------------------------
+
+# One row per team per game.
+team_games = team_offense.copy()
+
+# Match each team's game with the opponent's offensive
+# performance in that same game. That performance tells
+# us how the opponent's offense performed against this team.
+opponent_stats = team_offense[
+    [
+        "game_id",
+        "team",
+        "opponent",
+        "offensive_epa",
+        "offensive_success",
+        "offensive_pass_epa",
+        "offensive_rush_epa",
+        "offensive_yards_per_play"
+    ]
+].copy()
+
+opponent_stats = opponent_stats.rename(columns={
+    "team": "opponent",
+    "opponent": "team",
+    "offensive_epa": "def_epa_allowed",
+    "offensive_success": "def_success_allowed",
+    "offensive_pass_epa": "def_pass_epa_allowed",
+    "offensive_rush_epa": "def_rush_epa_allowed",
+    "offensive_yards_per_play": "def_yards_per_play_allowed"
+})
+
+team_games = team_games.merge(
+    opponent_stats,
+    on=["game_id", "team", "opponent"],
+    how="left",
+    validate="one_to_one"
+)
+
+
+# Identify the venue for each team's game
+game_locations = (
+    pbp[["game_id", "home_team"]]
+    .drop_duplicates(subset=["game_id"])
+)
+
+team_games = team_games.merge(
+    game_locations,
+    on="game_id",
+    how="left",
+    validate="many_to_one"
+)
+
+team_games["is_home"] = (
+    team_games["team"] == team_games["home_team"]
+).astype(int)
+
+
+# Features used to find similar teams and matchups.
+feature_cols = [
+    "offensive_epa",
+    "offensive_success",
+    "offensive_pass_epa",
+    "offensive_rush_epa",
+    "offensive_yards_per_play",
+    "def_epa_allowed",
+    "def_success_allowed",
+    "def_pass_epa_allowed",
+    "def_rush_epa_allowed",
+    "def_yards_per_play_allowed"
+]
+
+# Sort chronologically.
+team_games = team_games.sort_values(
+    ["season", "week", "game_id", "team"]
+).reset_index(drop=True)
+
+# Calculate rolling ratings using previous games only.
+# Calculate each team's average from its previous 4 games
+# within the same season. The current game is excluded.
+for col in feature_cols:
+    team_games[f"pregame_{col}"] = (
+        team_games
+        .groupby(["season", "team"])[col]
+        .transform(
+            lambda s: s.shift(1).rolling(
+                window=4,
+                min_periods=1
+            ).mean()
+        )
+    )
+
+# Venue-specific offensive and defensive statistics
+venue_stats = [
+    "offensive_epa",
+    "offensive_pass_epa",
+    "offensive_rush_epa",
+    "def_epa_allowed",
+    "def_pass_epa_allowed",
+    "def_rush_epa_allowed"
+]
+
+# Average each team's previous four games at the same venue.
+# shift(1) prevents the current game's results from leaking
+# into its pregame features.
+# Use previous games at the same venue across seasons
+for col in venue_stats:
+    team_games[f"pregame_home_away_{col}"] = (
+        team_games
+        .groupby(["team", "is_home"])[col]
+        .transform(
+            lambda s: s.shift(1).rolling(
+                window=4,
+                min_periods=1
+            ).mean()
+        )
+    )
+
+print("\nVenue-specific EPA ratings:")
+print(
+    team_games[
+        ["season", "week", "team", "opponent", "is_home",
+         "pregame_home_away_offensive_epa",
+         "pregame_home_away_def_epa_allowed"]
+    ].tail(10).to_string(index=False)
+)
+
+
+print("\nPregame team ratings:")
+print(
+    team_games[
+        ["season", "week", "team", "opponent"] +
+        [f"pregame_{c}" for c in feature_cols]
+    ].tail(10).to_string(index=False)
+)
+
+print("\nMissing pregame ratings:")
+print(
+    team_games[
+        [f"pregame_{c}" for c in feature_cols]
+    ].isna().sum()
+)
+
+
+
+# --------------------------------------------------
+# 5. PREPARE QB HISTORICAL SAMPLE
+# --------------------------------------------------
+
+qb_history = qb_games[
+    (qb_games["attempts"] >= 10) &
+    (qb_games["season"] >= 2021)
+].copy()
+
+# QB efficiency features.
+qb_history["completion_pct"] = (
+    qb_history["completions"] /
+    qb_history["attempts"].replace(0, np.nan)
+)
+
+qb_history["yards_per_attempt"] = (
+    qb_history["passing_yards"] /
+    qb_history["attempts"].replace(0, np.nan)
+)
+
+qb_history["total_yards"] = (
+    qb_history["passing_yards"] +
+    qb_history["rushing_yards"]
+)
+
+qb_history["total_tds"] = (
+    qb_history["passing_tds"] +
+    qb_history["rushing_tds"]
+)
+
+print("\nFiltered QB games:", len(qb_history))
+print(
+    qb_history[
+        ["season", "week", "qb_name", "team",
+         "opponent", "attempts", "passing_yards",
+         "passing_tds", "interceptions",
+         "rushing_yards"]
+    ].head(10).to_string(index=False)
+)
+
+
+
+#QB matchup dataset, joins each qb performance with teams offensive ratings and opponent defense
+# --------------------------------------------------
+# 1. GET TEAM OFFENSIVE RATINGS FOR EACH QB GAME
+# --------------------------------------------------
+
+
+pregame_cols = [
+    "pregame_offensive_epa",
+    "pregame_offensive_success",
+    "pregame_offensive_pass_epa",
+    "pregame_offensive_rush_epa",
+    "pregame_offensive_yards_per_play",
+    "pregame_def_epa_allowed",
+    "pregame_def_success_allowed",
+    "pregame_def_pass_epa_allowed",
+    "pregame_def_rush_epa_allowed",
+    "pregame_def_yards_per_play_allowed",
+
+    # Venue-specific ratings
+    "pregame_home_away_offensive_epa",
+    "pregame_home_away_offensive_pass_epa",
+    "pregame_home_away_offensive_rush_epa",
+    "pregame_home_away_def_epa_allowed",
+    "pregame_home_away_def_pass_epa_allowed",
+    "pregame_home_away_def_rush_epa_allowed"
+]
+
+
+# One row per team per game, containing only pregame ratings
+ratings = team_games[
+    ["season", "week", "game_id", "team", "home_team"]
+    + pregame_cols
+].copy()
+
+# Add the QB's own team's ratings
+qb_model_data = qb_history.merge(
+    ratings,
+    on=["season", "week", "game_id", "team"],
+    how="left",
+    validate="many_to_one"
+)
+
+
+# Add home/away information to each QB game
+# Add home/away information only if it isn't already present
+# Recover home_team if a previous merge created duplicate columns
+if "home_team" not in qb_model_data.columns:
+    if "home_team_x" in qb_model_data.columns:
+        qb_model_data["home_team"] = qb_model_data["home_team_x"]
+    elif "home_team_y" in qb_model_data.columns:
+        qb_model_data["home_team"] = qb_model_data["home_team_y"]
+    else:
+        game_locations = (
+            pbp[["game_id", "home_team"]]
+            .drop_duplicates(subset=["game_id"])
+        )
+
+        qb_model_data = qb_model_data.merge(
+            game_locations,
+            on="game_id",
+            how="left",
+            validate="many_to_one"
+        )
+
+qb_model_data["is_home"] = (
+    qb_model_data["team"] == qb_model_data["home_team"]
+).astype(int)
+
+# Rename opponent's defensive ratings so they're easy to identify
+
+opponent_defense = ratings[
+    [
+        "season", "week", "game_id", "team",
+        "pregame_def_epa_allowed",
+        "pregame_def_success_allowed",
+        "pregame_def_pass_epa_allowed",
+        "pregame_def_rush_epa_allowed",
+        "pregame_def_yards_per_play_allowed",
+        "pregame_home_away_def_epa_allowed",
+        "pregame_home_away_def_pass_epa_allowed",
+        "pregame_home_away_def_rush_epa_allowed"
+    ]
+].copy()
+
+opponent_defense = opponent_defense.rename(columns={
+    "team": "opponent",
+    "pregame_def_epa_allowed":
+        "opp_pregame_def_epa_allowed",
+    "pregame_def_success_allowed":
+        "opp_pregame_def_success_allowed",
+    "pregame_def_pass_epa_allowed":
+        "opp_pregame_def_pass_epa_allowed",
+    "pregame_def_rush_epa_allowed":
+        "opp_pregame_def_rush_epa_allowed",
+    "pregame_def_yards_per_play_allowed":
+        "opp_pregame_def_yards_per_play_allowed",
+
+    # The opponent's venue-specific defensive ratings
+    "pregame_home_away_def_epa_allowed":
+        "opp_pregame_home_away_def_epa_allowed",
+    "pregame_home_away_def_pass_epa_allowed":
+        "opp_pregame_home_away_def_pass_epa_allowed",
+    "pregame_home_away_def_rush_epa_allowed":
+        "opp_pregame_home_away_def_rush_epa_allowed"
+})
+
+
+
+
+# Join the defense the QB actually faced
+qb_model_data = qb_model_data.merge(
+    opponent_defense,
+    on=["season", "week", "game_id", "opponent"],
+    how="left",
+    validate="many_to_one"
+)
+
+print("QB model dataset:", qb_model_data.shape)
+print("\nMissing matchup ratings:")
+print(
+    qb_model_data[
+        ["pregame_offensive_epa",
+         "opp_pregame_def_epa_allowed"]
+    ].isna().sum()
+)
+# add each qb previous 4 game avg
+# --------------------------------------------------
+# 2. QB RECENT FORM: PREVIOUS FOUR QUALIFYING GAMES
+# --------------------------------------------------
+
+qb_model_data = qb_model_data.sort_values(
+    ["season", "week", "game_id"]
+).reset_index(drop=True)
+
+qb_recent_stats = [
+    "attempts",
+    "completions",
+    "passing_yards",
+    "passing_tds",
+    "interceptions",
+    "rushing_attempts",
+    "rushing_yards",
+    "rushing_tds"
+]
+
+for col in qb_recent_stats:
+    qb_model_data[f"qb_recent_{col}"] = (
+        qb_model_data
+        .groupby("qb_id")[col]
+        .transform(
+            lambda s: s.shift(1).rolling(
+                window=4,
+                min_periods=1
+            ).mean()
+        )
+    )
+
+# Add recent completion percentage and yards per attempt
+qb_model_data["qb_recent_completion_pct"] = (
+    qb_model_data["qb_recent_completions"] /
+    qb_model_data["qb_recent_attempts"].replace(0, np.nan)
+)
+
+qb_model_data["qb_recent_yards_per_attempt"] = (
+    qb_model_data["qb_recent_passing_yards"] /
+    qb_model_data["qb_recent_attempts"].replace(0, np.nan)
+)
+
+print("\nExample QB matchup features:")
+print(
+    qb_model_data[
+        [
+            "season", "week", "qb_name", "team", "opponent",
+            "qb_recent_passing_yards",
+            "qb_recent_passing_tds",
+            "qb_recent_rushing_yards",
+            "pregame_offensive_epa",
+            "opp_pregame_def_pass_epa_allowed"
+        ]
+    ].tail(15).to_string(index=False)
+)
+
+
+# --------------------------------------------------
+# 3. PREPARE DATA FOR MODEL TRAINING
+# --------------------------------------------------
+
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_absolute_error, root_mean_squared_error
+
+# Features available before kickoff
+
+feature_cols = [
+    "qb_recent_attempts",
+    "qb_recent_completions",
+    "qb_recent_passing_yards",
+    "qb_recent_passing_tds",
+    "qb_recent_interceptions",
+    "qb_recent_rushing_attempts",
+    "qb_recent_rushing_yards",
+    "qb_recent_rushing_tds",
+    "qb_recent_completion_pct",
+    "qb_recent_yards_per_attempt",
+    "pregame_offensive_epa",
+    "pregame_offensive_success",
+    "pregame_offensive_pass_epa",
+    "pregame_offensive_rush_epa",
+    "pregame_offensive_yards_per_play",
+    "opp_pregame_def_epa_allowed",
+    "opp_pregame_def_success_allowed",
+    "opp_pregame_def_pass_epa_allowed",
+    "opp_pregame_def_rush_epa_allowed",
+    "opp_pregame_def_yards_per_play_allowed",
+    "is_home", 
+    "pregame_home_away_offensive_epa",
+    "pregame_home_away_offensive_pass_epa",
+    "pregame_home_away_offensive_rush_epa",
+    "pregame_home_away_def_epa_allowed",
+    "pregame_home_away_def_pass_epa_allowed",
+    "pregame_home_away_def_rush_epa_allowed",
+    "opp_pregame_home_away_def_epa_allowed",
+    "opp_pregame_home_away_def_pass_epa_allowed",
+    "opp_pregame_home_away_def_rush_epa_allowed"
+]
+
+
+
+
+# Stats we want to predict
+target_cols = [
+    "passing_yards",
+    "passing_tds",
+    "interceptions",
+    "rushing_yards",
+    "rushing_tds"
+]
+
+# Remove rows missing any required feature or target
+model_data = qb_model_data.dropna(
+    subset=feature_cols + target_cols
+).copy()
+
+print("Usable QB-game rows:", len(model_data))
+print("Seasons available:", sorted(model_data["season"].unique()))
+print(model_data.groupby("season").size())
+
+
+# ==========================================
+# 1. SPLIT DATA INTO TRAINING AND TESTING
+# ==========================================
+
+train = model_data[model_data["season"] <= 2024].copy()
+test = model_data[model_data["season"] == 2025].copy()
+
+X_train = train[feature_cols]
+X_test = test[feature_cols]
+
+print("Training rows:", len(train))
+print("Testing rows:", len(test))
+
+
+# ==========================================
+# 2. LINEAR REGRESSION EVALUATION
+# ==========================================
+
+predictions = test[
+    ["season", "week", "game_id", "qb_id",
+     "qb_name", "team", "opponent"]
+].copy()
+
+linear_models = {}
+linear_results = []
+
+for target in target_cols:
+    model = LinearRegression()
+
+    # Train the model
+    model.fit(X_train, train[target])
+
+    # Predict the 2025 test games
+    y_pred = model.predict(X_test)
+
+    # Save model and predictions
+    linear_models[target] = model
+    predictions[f"actual_{target}"] = test[target].to_numpy()
+    predictions[f"predicted_{target}"] = y_pred
+
+    # Calculate mean absolute error
+    mae = np.mean(np.abs(test[target].to_numpy() - y_pred))
+
+    linear_results.append({
+        "Stat": target,
+        "LinearRegression_MAE": mae
+    })
+
+print("\n" + "=" * 75)
+print("LINEAR REGRESSION RESULTS")
+print("=" * 75)
+print(pd.DataFrame(linear_results).round(3).to_string(index=False))
+
+
+# ==========================================
+# 3. TREE-BASED MODEL
+# HIST GRADIENT BOOSTING
+# ==========================================
+
+tree_models = {}
+tree_results = []
+
+for target in target_cols:
+    tree_model = HistGradientBoostingRegressor(
+        max_iter=200,
+        learning_rate=0.05,
+        max_leaf_nodes=15,
+        l2_regularization=1.0,
+        random_state=42
+    )
+
+    # Train on the same data
+    tree_model.fit(X_train, train[target])
+
+    # Predict the same 2025 test games
+    tree_pred = tree_model.predict(X_test)
+
+    tree_models[target] = tree_model
+
+    # Compare both models on the same rows
+    actual = test[target].to_numpy()
+    linear_pred = predictions[f"predicted_{target}"].to_numpy()
+
+    linear_mae = np.mean(np.abs(actual - linear_pred))
+    tree_mae = np.mean(np.abs(actual - tree_pred))
+
+    improvement = linear_mae - tree_mae
+    improvement_pct = (
+        improvement / linear_mae * 100
+        if linear_mae != 0 else 0
+    )
+
+    tree_results.append({
+        "Stat": target,
+        "Linear_MAE": linear_mae,
+        "Tree_MAE": tree_mae,
+        "MAE_Improvement": improvement,
+        "Improvement_Percent": improvement_pct
+    })
+
+tree_results_df = pd.DataFrame(tree_results)
+
+print("\n" + "=" * 85)
+print("LINEAR REGRESSION VS TREE-BASED MODEL")
+print("=" * 85)
+print(tree_results_df.round(3).to_string(index=False))
+
+
+# ==========================================
+# 4. RECENT FOUR-GAME BASELINE
+# ==========================================
+
+baseline_history = qb_history[
+    ["season", "week", "game_id", "qb_id"] + target_cols
+].copy()
+
+baseline_history = baseline_history.sort_values(
+    ["season", "week", "game_id", "qb_id"]
+).reset_index(drop=True)
+
+baseline_cols = []
+
+# Use only previous qualifying games for each quarterback
+for target in target_cols:
+    baseline_col = f"baseline_{target}"
+    baseline_cols.append(baseline_col)
+
+    baseline_history[baseline_col] = (
+        baseline_history.groupby("qb_id")[target]
+        .transform(
+            lambda s: s.shift(1).rolling(
+                window=4, min_periods=1
+            ).mean()
+        )
+    )
+
+join_cols = ["season", "week", "game_id", "qb_id"]
+
+baseline_predictions = test[join_cols].merge(
+    baseline_history[join_cols + baseline_cols],
+    on=join_cols,
+    how="left",
+    validate="one_to_one"
+)
+
+# For QBs without previous qualifying games, use
+# the training-set mean for that statistic.
+for target, baseline_col in zip(target_cols, baseline_cols):
+    baseline_predictions[baseline_col] = (
+        baseline_predictions[baseline_col]
+        .fillna(train[target].mean())
+    )
+
+
+# ==========================================
+# 5. COMPARE ALL THREE METHODS
+# ==========================================
+
+comparison_results = []
+
+for target, baseline_col in zip(target_cols, baseline_cols):
+    actual = test[target].to_numpy()
+
+    linear_pred = predictions[
+        f"predicted_{target}"
+    ].to_numpy()
+
+    # Recreate tree predictions for this target
+    tree_pred = tree_models[target].predict(X_test)
+
+    baseline_pred = baseline_predictions[
+        baseline_col
+    ].to_numpy()
+
+    linear_mae = np.mean(np.abs(actual - linear_pred))
+    tree_mae = np.mean(np.abs(actual - tree_pred))
+    baseline_mae = np.mean(np.abs(actual - baseline_pred))
+
+    comparison_results.append({
+        "Stat": target,
+        "Recent4_MAE": baseline_mae,
+        "Linear_MAE": linear_mae,
+        "Tree_MAE": tree_mae,
+        "Best_Model": min(
+            [
+                ("Recent4", baseline_mae),
+                ("Linear", linear_mae),
+                ("Tree", tree_mae)
+            ],
+            key=lambda x: x[1]
+        )[0]
+    })
+
+comparison_df = pd.DataFrame(comparison_results)
+
+print("\n" + "=" * 85)
+print("FINAL COMPARISON: RECENT FOUR GAMES VS LINEAR VS TREE")
+print("=" * 85)
+print(comparison_df.round(3).to_string(index=False))
+
+
+# ==========================================
+# 6. TRAIN FINAL LINEAR MODELS FOR FUTURE GAMES
+# ==========================================
+# This preserves your current future-prediction setup.
+# Update the cutoff if week 5 is not the latest completed
+# 2026 week in your dataset.
+
+final_train = model_data[
+    (model_data["season"] < 2026) |
+    (
+        (model_data["season"] == 2026) &
+        (model_data["week"] <= 5)
+    )
+].copy()
+
+final_models = {}
+
+for target in target_cols:
+    model = LinearRegression()
+    model.fit(final_train[feature_cols], final_train[target])
+    final_models[target] = model
+
+print("\nFinal linear models trained on", len(final_train), "rows.")
+
+
+
+
+
+
+
+# ==========================================
+# PREDICTION ERROR RANGES
+# ==========================================
+
+targets = [
+    "passing_yards",
+    "passing_tds",
+    "interceptions",
+    "rushing_yards",
+    "rushing_tds"
+]
+
+range_results = []
+
+for target in targets:
+    actual_col = f"actual_{target}"
+    predicted_col = f"predicted_{target}"
+
+    errors = (
+        predictions[actual_col] - predictions[predicted_col]
+    ).dropna()
+
+    range_results.append({
+        "Stat": target,
+        "MAE": errors.abs().mean(),
+        "10th_pct_error": errors.quantile(0.10),
+        "Median_error": errors.median(),
+        "90th_pct_error": errors.quantile(0.90)
+    })
+
+error_ranges = pd.DataFrame(range_results)
+
+print("\nPREDICTION ERROR RANGES")
+print(error_ranges.round(2).to_string(index=False))
+
+
+def add_prediction_ranges(prediction_df, error_ranges):
+    result = prediction_df.copy()
+
+    for _, row in error_ranges.iterrows():
+        stat = row["Stat"]
+
+        if stat not in result.columns:
+            continue
+
+        # Historical error = actual - predicted
+        result[f"{stat}_low"] = (
+            result[stat] + row["10th_pct_error"]
+        ).clip(lower=0)
+
+        result[f"{stat}_high"] = (
+            result[stat] + row["90th_pct_error"]
+        ).clip(lower=0)
+
+    return result
+
+
+# --------------------------------------------------
+# PREDICT A FUTURE QB STATLINE
+# --------------------------------------------------
+
+def predict_qb_matchup(
+    qb_name,
+    team,
+    opponent,
+    is_home,
+    data=qb_model_data
+):
+    """
+    Predict a QB's statline for a future matchup.
+
+    Example:
+        predict_qb_matchup("B.Purdy", "SF", "SEA")
+    """
+
+    # Get this QB's most recent game in the data.
+    # The rolling features on that row represent pregame information
+    # available before that historical game.
+    qb_rows = data[
+        (data["qb_name"] == qb_name) &
+        (data["team"] == team)
+    ].sort_values(["season", "week", "game_id"])
+
+    if qb_rows.empty:
+        raise ValueError(
+            f"No historical data found for {qb_name} on {team}."
+        )
+
+    latest = qb_rows.iloc[-1]
+
+    # Use the QB's latest available pregame features as a starting point.
+    # Replace the opponent defense features with the specified opponent's
+    # most recent pregame defensive ratings.
+    opponent_rows = team_games[
+        (team_games["team"] == opponent) &
+        (team_games["season"] == latest["season"]) &
+        (team_games["week"] <= latest["week"])
+    ].sort_values(["season", "week", "game_id"])
+
+    if opponent_rows.empty:
+        opponent_rows = team_games[
+            team_games["team"] == opponent
+        ].sort_values(["season", "week", "game_id"])
+
+    if opponent_rows.empty:
+        raise ValueError(f"No team data found for {opponent}.")
+
+    opponent_latest = opponent_rows.iloc[-1]
+
+    # Start with the QB's latest feature row.
+    X = latest[feature_cols].to_frame().T.copy()
+    X.loc[:, "is_home"] = int(is_home)
+    # Update the opponent defense ratings.
+    defense_map = {
+        "opp_pregame_def_epa_allowed": "pregame_def_epa_allowed",
+        "opp_pregame_def_success_allowed": "pregame_def_success_allowed",
+        "opp_pregame_def_pass_epa_allowed": "pregame_def_pass_epa_allowed",
+        "opp_pregame_def_rush_epa_allowed": "pregame_def_rush_epa_allowed",
+        "opp_pregame_def_yards_per_play_allowed": "pregame_def_yards_per_play_allowed",
+    }
+
+    for model_col, team_col in defense_map.items():
+        if model_col in X.columns and team_col in opponent_latest.index:
+            X.loc[:, model_col] = opponent_latest[team_col]
+
+    # Predict the five stats.
+    result = {
+        "QB": qb_name,
+        "Team": team,
+        "Opponent": opponent,
+    }
+
+    for target, model in final_models.items():
+        result[target] = max(0, float(model.predict(X)[0]))
+
+    return pd.DataFrame([result])
+
+# San Francisco is hosting Seattle
+print(
+    predict_qb_matchup(
+        qb_name="B.Purdy",
+        team="SF",
+        opponent="SEA",
+        is_home=0
+    ).round(2).to_string(index=False)
+)
+
+# San Francisco is playing at Seattle
+
+
+print( predict_qb_matchup(
+    qb_name="J.Brissett",
+    team="ARI",
+    opponent="DET",
+    is_home=1
+    ).round(2).to_string(index=False)
+)
+
+
+
+# =========================================================
+# PREDICT EVERY QB FOR NFL WEEK 6, 2026
+# =========================================================
+
+import pandas as pd
+
+# Away team, Home team
+week6_games = [
+    ("SEA", "DEN"),
+    ("HOU", "JAX"),
+    ("CAR", "PHI"),
+    ("CHI", "ATL"),
+    ("NO",  "NYG"),
+    ("NYJ", "NE"),
+    ("TEN", "IND"),
+    ("PIT", "TB"),
+    ("BAL", "CLE"),
+    ("ARI", "LA"),
+    ("BUF", "LV"),
+    ("LAC", "KC"),
+    ("DAL", "GB"),
+    ("WAS", "SF")
+]
+
+# Find the most recent QB with at least 10 pass attempts
+# for each team in your historical data.
+def get_latest_qb(team):
+    team_data = qb_history[
+        qb_history["team"] == team
+    ].copy()
+
+    if team_data.empty:
+        return None
+
+    team_data = team_data.sort_values(
+        ["season", "week", "game_id"]
+    )
+
+    # Find the team's most recent game with a qualifying QB.
+    latest_game_id = team_data.iloc[-1]["game_id"]
+
+    latest_game = team_data[
+        team_data["game_id"] == latest_game_id
+    ]
+
+    # If multiple QBs played, select the one with
+    # the most passing attempts in that game.
+    latest_game = latest_game.sort_values(
+        "attempts", ascending=False
+    )
+
+    return latest_game.iloc[0]["qb_name"]
+
+
+# Generate projections for both teams in every game.
+week6_predictions = []
+skipped_teams = []
+
+for away_team, home_team in week6_games:
+
+    # Away QB
+    away_qb = get_latest_qb(away_team)
+
+    if away_qb is not None:
+        try:
+            away_prediction = predict_qb_matchup(
+                qb_name=away_qb,
+                team=away_team,
+                opponent=home_team,
+                is_home=0
+            )
+
+            
+            row = away_prediction.iloc[0].to_dict()
+            row["Game"] = f"{away_team} @ {home_team}"
+
+            # Add the opponent's defensive stats.
+            opp_stats = team_games[
+                team_games["team"] == home_team
+            ].sort_values(["season", "week", "game_id"])
+
+            opp_stats = opp_stats.tail(5)
+
+            if not opp_stats.empty:
+                row["Opp_Def_EPA"] = opp_stats["def_epa_allowed"].mean()
+                row["Opp_Def_Pass_EPA"] = opp_stats["def_pass_epa_allowed"].mean()
+                row["Opp_Def_Rush_EPA"] = opp_stats["def_rush_epa_allowed"].mean()
+                row["Opp_Def_Success"] = opp_stats["def_success_allowed"].mean()
+                row["Opp_Def_Yards_Play"] = opp_stats["def_yards_per_play_allowed"].mean()
+
+            week6_predictions.append(row)
+
+
+        except (ValueError, KeyError) as error:
+            skipped_teams.append(
+                (away_team, away_qb, str(error))
+            )
+    else:
+        skipped_teams.append(
+            (away_team, None, "No qualifying QB history")
+        )
+
+    # Home QB
+    home_qb = get_latest_qb(home_team)
+
+    if home_qb is not None:
+        try:
+            home_prediction = predict_qb_matchup(
+                qb_name=home_qb,
+                team=home_team,
+                opponent=away_team,
+                is_home=1
+            )
+
+            
+            row = home_prediction.iloc[0].to_dict()
+            row["Game"] = f"{away_team} @ {home_team}"
+
+            # Add the opponent's defensive stats.
+            opp_stats = team_games[
+                team_games["team"] == away_team
+            ].sort_values(["season", "week", "game_id"])
+#make sure to update for each week
+            opp_stats = opp_stats.tail(5)
+
+            if not opp_stats.empty:
+                row["Opp_Def_EPA"] = opp_stats["def_epa_allowed"].mean()
+                row["Opp_Def_Pass_EPA"] = opp_stats["def_pass_epa_allowed"].mean()
+                row["Opp_Def_Rush_EPA"] = opp_stats["def_rush_epa_allowed"].mean()
+                row["Opp_Def_Success"] = opp_stats["def_success_allowed"].mean()
+                row["Opp_Def_Yards_Play"] = opp_stats["def_yards_per_play_allowed"].mean()
+
+            week6_predictions.append(row)
+
+
+        except (ValueError, KeyError) as error:
+            skipped_teams.append(
+                (home_team, home_qb, str(error))
+            )
+    else:
+        skipped_teams.append(
+            (home_team, None, "No qualifying QB history")
+        )
+
+
+# Display the full projection table.
+week6_table = pd.DataFrame(week6_predictions)
+
+if not week6_table.empty:
+    
+    display_cols = [
+        "Game", "QB", "Team", "Opponent",
+        "passing_yards", "passing_tds", "interceptions",
+        "rushing_yards", "rushing_tds",
+        "Opp_Def_EPA", "Opp_Def_Pass_EPA",
+        "Opp_Def_Rush_EPA", "Opp_Def_Success",
+        "Opp_Def_Yards_Play"
+    ]
+
+
+    display_cols = [
+        col for col in display_cols
+        if col in week6_table.columns
+    ]
+
+    week6_table = week6_table[display_cols].sort_values(
+        "Opp_Def_EPA",
+        ascending=True
+    ).reset_index(drop=True)
+
+    print("\nWEEK 6 2026 — QB PROJECTIONS")
+    print(week6_table.round(2).to_string(index=False))
+
+    # Save results to a CSV file in your Codespace.
+    week6_table.to_csv(
+        "week6_2026_qb_predictions.csv",
+        index=False
+    )
+
+    print("\nSaved to week6_2026_qb_predictions.csv")
+
+else:
+    print("No predictions were generated. Check team codes and QB history.")
+
+
+if skipped_teams:
+    print("\nTEAMS THAT COULD NOT BE PREDICTED")
+    for team, qb, reason in skipped_teams:
+        print(f"{team} | QB={qb} | {reason}")
+
+
+
+#week 5 qb predictions
+# Away team, Home team
+week5_games = [
+    ("TB",  "DAL"),
+    ("PHI", "JAX"),
+    ("CLE", "NYJ"),
+    ("CIN", "MIA"),
+    ("LV",  "NE"),
+    ("MIN", "NO"),
+    ("HOU", "TEN"),
+    ("NYG", "WAS"),
+    ("IND", "PIT"),
+    ("CHI", "GB"),
+    ("DEN", "LAC"),
+    ("DET", "ARI"),
+    ("SF",  "SEA"),
+    ("BAL", "ATL"),
+    ("BUF", "LA")
+]
+
+# Find the most recent QB with at least 10 pass attempts
+# for each team in your historical data.
+def get_latest_qb(team):
+    team_data = qb_history[
+        qb_history["team"] == team
+    ].copy()
+
+    if team_data.empty:
+        return None
+
+    team_data = team_data.sort_values(
+        ["season", "week", "game_id"]
+    )
+
+    # Find the team's most recent game with a qualifying QB.
+    latest_game_id = team_data.iloc[-1]["game_id"]
+
+    latest_game = team_data[
+        team_data["game_id"] == latest_game_id
+    ]
+
+    # If multiple QBs played, select the one with
+    # the most passing attempts in that game.
+    latest_game = latest_game.sort_values(
+        "attempts", ascending=False
+    )
+
+    return latest_game.iloc[0]["qb_name"]
+
+
+# Generate projections for both teams in every game.
+week5_predictions = []
+skipped_teams = []
+
+for away_team, home_team in week5_games:
+
+    # Away QB
+    away_qb = get_latest_qb(away_team)
+
+    if away_qb is not None:
+        try:
+            away_prediction = predict_qb_matchup(
+                qb_name=away_qb,
+                team=away_team,
+                opponent=home_team,
+                is_home=0
+            )
+
+            
+            row = away_prediction.iloc[0].to_dict()
+            row["Game"] = f"{away_team} @ {home_team}"
+
+            # Add the opponent's defensive stats.
+            opp_stats = team_games[
+                (team_games["team"] == home_team) &
+                (team_games["season"] == 2026) &
+                (team_games["week"] < 5)
+            ].sort_values(["week", "game_id"])
+
+            if not opp_stats.empty:
+                row["Opp_Def_EPA"] = opp_stats["def_epa_allowed"].mean()
+                row["Opp_Def_Pass_EPA"] = opp_stats["def_pass_epa_allowed"].mean()
+                row["Opp_Def_Rush_EPA"] = opp_stats["def_rush_epa_allowed"].mean()
+                row["Opp_Def_Success"] = opp_stats["def_success_allowed"].mean()
+                row["Opp_Def_Yards_Play"] = opp_stats["def_yards_per_play_allowed"].mean()
+
+            week5_predictions.append(row)
+
+
+        except (ValueError, KeyError) as error:
+            skipped_teams.append(
+                (away_team, away_qb, str(error))
+            )
+    else:
+        skipped_teams.append(
+            (away_team, None, "No qualifying QB history")
+        )
+
+    # Home QB
+    home_qb = get_latest_qb(home_team)
+
+    if home_qb is not None:
+        try:
+            home_prediction = predict_qb_matchup(
+                qb_name=home_qb,
+                team=home_team,
+                opponent=away_team,
+                is_home=1
+            )
+
+            
+            row = home_prediction.iloc[0].to_dict()
+            row["Game"] = f"{away_team} @ {home_team}"
+
+            # Add the opponent's defensive stats.
+            opp_stats = team_games[
+                (team_games["team"] == away_team) &
+                (team_games["season"] == 2026) &
+                (team_games["week"] < 5)
+            ].sort_values(["week", "game_id"])
+
+            if not opp_stats.empty:
+                row["Opp_Def_EPA"] = opp_stats["def_epa_allowed"].mean()
+                row["Opp_Def_Pass_EPA"] = opp_stats["def_pass_epa_allowed"].mean()
+                row["Opp_Def_Rush_EPA"] = opp_stats["def_rush_epa_allowed"].mean()
+                row["Opp_Def_Success"] = opp_stats["def_success_allowed"].mean()
+                row["Opp_Def_Yards_Play"] = opp_stats["def_yards_per_play_allowed"].mean()
+
+            week5_predictions.append(row)
+
+
+        except (ValueError, KeyError) as error:
+            skipped_teams.append(
+                (home_team, home_qb, str(error))
+            )
+    else:
+        skipped_teams.append(
+            (home_team, None, "No qualifying QB history")
+        )
+
+
+# Display the full projection table.
+week5_table = pd.DataFrame(week5_predictions)
+
+if not week5_table.empty:
+    
+    display_cols = [
+        "Game", "QB", "Team", "Opponent",
+        "passing_yards", "passing_tds", "interceptions",
+        "rushing_yards", "rushing_tds",
+        "Opp_Def_EPA", "Opp_Def_Pass_EPA",
+        "Opp_Def_Rush_EPA", "Opp_Def_Success",
+        "Opp_Def_Yards_Play"
+    ]
+
+
+    display_cols = [
+        col for col in display_cols
+        if col in week5_table.columns
+    ]
+
+    week5_table = week5_table[display_cols].sort_values(
+        "Opp_Def_EPA",
+        ascending=True
+    ).reset_index(drop=True)
+
+    print("\nWEEK 5 2026 — QB PROJECTIONS")
+    print(week5_table.round(2).to_string(index=False))
+
+    # Save results to a CSV file in your Codespace.
+    week5_table.to_csv(
+        "week5_2026_qb_predictions.csv",
+        index=False
+    )
+
+    print("\nSaved to week5_2026_qb_predictions.csv")
+
+else:
+    print("No predictions were generated. Check team codes and QB history.")
+
+
+if skipped_teams:
+    print("\nTEAMS THAT COULD NOT BE PREDICTED")
+    for team, qb, reason in skipped_teams:
+        print(f"{team} | QB={qb} | {reason}")
+
+#so far look at over if opp def yards play over 6 and positive opp def epa look at fantasy score
+#under 5 yards per play and negative opp def
+#3 lowest opp def epa went under prediction, 3 highest above

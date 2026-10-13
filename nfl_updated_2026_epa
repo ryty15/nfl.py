@@ -1,0 +1,731 @@
+
+import nflreadpy as nfl
+import pandas as pd
+import numpy as np
+from sklearn.linear_model import LinearRegression
+
+# ============================================================
+# SETTINGS
+# ============================================================
+# Establish Perameters, Historical seasons to train model, Predicting 2026, simulated games and seasons
+TRAIN_SEASONS = [2024, 2025]
+PREDICT_SEASON = 2026
+
+N_GAME_SIMS = 20000
+N_SEASON_SIMS = 20000
+
+RANDOM_SEED = 42
+rng = np.random.default_rng(RANDOM_SEED)
+
+# ============================================================
+# 1. LOAD DATA
+# ============================================================
+#load the play by play data for the training seasons, load schudles as wekk
+#also load play by play and schedules for 2026
+pbp_train = nfl.load_pbp(TRAIN_SEASONS).to_pandas()
+schedules_train = nfl.load_schedules(TRAIN_SEASONS).to_pandas()
+
+pbp_26 = nfl.load_pbp(PREDICT_SEASON).to_pandas()
+schedules_26 = nfl.load_schedules(PREDICT_SEASON).to_pandas()
+
+# ============================================================
+# 2. CALCULATE TEAM EPA PER GAME
+# ============================================================
+#filter through regular season only plays, plays with an EPA, plays with offensive and defensive team
+
+def compute_team_epa_per_game(pbp):
+    pbp_reg = pbp[
+        (pbp['season_type'] == 'REG') &
+        (pbp['epa'].notna()) &
+        (pbp['posteam'].notna()) &
+        (pbp['defteam'].notna())
+    ].copy()
+
+    # Offensive EPA by team and season
+    #Sepearate data by season and offensive team, aggregate calculates offensive epa sum across all team plays, games played where team was on offense
+    off = (
+        pbp_reg.groupby(['season', 'posteam'])
+        .agg(
+            off_epa=('epa', 'sum'),
+            games_played_off=('game_id', 'nunique')
+        )
+        .reset_index()
+        .rename(columns={'posteam': 'team'})
+    )
+
+    # Defensive EPA allowed by team and season
+    #calculates how much EPA teams gained against defensive team, lower epa better
+    defense = (
+        pbp_reg.groupby(['season', 'defteam'])
+        .agg(
+            def_epa_allowed=('epa', 'sum'),
+            games_played_def=('game_id', 'nunique')
+        )
+        .reset_index()
+        .rename(columns={'defteam': 'team'})
+    )
+
+    # Merge using both season and team
+    team_epa = off.merge(
+        defense,
+        on=['season', 'team'],
+        how='inner'
+    )
+
+    team_epa['off_epa_per_game'] = (
+        team_epa['off_epa'] /
+        team_epa['games_played_off']
+    )
+
+    team_epa['def_epa_allowed_per_game'] = (
+        team_epa['def_epa_allowed'] /
+        team_epa['games_played_def']
+    )
+
+    # Higher net EPA is better, offensive epa divided by defensive epa
+    team_epa['net_epa_per_game'] = (
+        team_epa['off_epa_per_game'] -
+        team_epa['def_epa_allowed_per_game']
+    )
+
+    return team_epa
+
+
+# ============================================================
+# 3. CALCULATE WINS
+# ============================================================
+#for regular season games, forecasting 2026 games
+def compute_season_wins(schedules):
+    games = schedules[
+        (schedules['game_type'] == 'REG') &
+        schedules['home_score'].notna() &
+        schedules['away_score'].notna()
+    ].copy()
+
+    # Home-team results, find the teams involved in the game and how many points scored
+    home = games[
+        ['season', 'home_team', 'home_score', 'away_score']
+    ].copy()
+
+    home.columns = [
+        'season', 'team', 'points_for', 'points_against'
+    ]
+
+    # Away-team results
+    away = games[
+        ['season', 'away_team', 'away_score', 'home_score']
+    ].copy()
+
+    away.columns = [
+        'season', 'team', 'points_for', 'points_against'
+    ]
+#stacks home and away records vertically Home team 24, points against 17
+    results = pd.concat([home, away], ignore_index=True)
+
+    # NFL ties count as half a win, assign win values, 1 for win
+    results['win_value'] = np.select(
+        [
+            results['points_for'] > results['points_against'],
+            results['points_for'] == results['points_against']
+        ],
+        [1.0, 0.5],
+        default=0.0
+    )
+#sum wins by team and season
+    return (
+        results.groupby(['season', 'team'], as_index=False)
+        .agg(wins=('win_value', 'sum'))
+    )
+
+
+# ============================================================
+# 4. TRAIN ON 2024 AND 2025
+# ============================================================
+#calc EPA and actual wins each season 
+team_epa_train = compute_team_epa_per_game(pbp_train)
+wins_train = compute_season_wins(schedules_train)
+
+# Match the correct team's EPA and wins in each season, creates training dataset where each row contains one team's EPA and wins
+train = team_epa_train.merge(
+    wins_train,
+    on=['season', 'team'],
+    how='inner'
+)
+ 
+# Train a model that estimates season wins from EPA, X= info given to model, y= outcome you want to learn to predict, inputs are offensive and defensive EPA, y= total season wins
+X_train_wins = train[
+    ['off_epa_per_game', 'def_epa_allowed_per_game']
+]
+
+y_train_wins = train['wins']
+#fit model, using linear regression
+wins_model = LinearRegression()
+wins_model.fit(X_train_wins, y_train_wins)
+
+print("Training rows:", len(train))
+print("Win model trained on:", TRAIN_SEASONS)
+
+# Show original linear model predictions, shows predictions of 2024 and 2025 seasons
+train_predictions = wins_model.predict(X_train_wins)
+
+print("\nOriginal Linear Model — Training Predictions")
+print(pd.DataFrame({
+    "team": train["team"].values,
+    "season": train["season"].values,
+    "actual_wins": y_train_wins.values,
+    "predicted_wins": train_predictions
+}).round(2).to_string(index=False))
+
+# show 2026 predictions of linear models
+#find team epa for 2026
+team_epa_2026= compute_team_epa_per_game(pbp_26)
+
+#select features the model learned from in 2024,2025
+X_2026_wins= team_epa_2026[['off_epa_per_game','def_epa_allowed_per_game']]
+
+#predict full season wins for 2026
+predictions_2026= wins_model.predict(X_2026_wins)
+#display predictions
+print("\nOriginal Linear Model-2026")
+print(pd.DataFrame({
+    "team":team_epa_2026["team"].values,
+    "predicted_wins":predictions_2026}).sort_values(
+        "predicted_wins", ascending=False).round(2).to_string(index=False))
+
+
+
+# ============================================================
+# 5. TRAIN A GAME MARGIN MODEL
+# ============================================================
+#Predict score difference in individual matchup
+def build_game_training_data(schedules, team_epa):
+    games = schedules[
+        (schedules['game_type'] == 'REG') &
+        schedules['home_score'].notna() &
+        schedules['away_score'].notna()
+    ].copy()
+
+    games['point_diff'] = (
+        games['home_score'] - games['away_score']
+    )
+
+    epa = team_epa[
+        [
+            'season', 'team',
+            'off_epa_per_game',
+            'def_epa_allowed_per_game'
+        ]
+    ]
+
+    # Home-team ratings, attach home team EPA and def EPA
+    games = games.merge(
+        epa,
+        left_on=['season', 'home_team'],
+        right_on=['season', 'team'],
+        how='inner'
+    )
+
+    games = games.rename(columns={
+        'off_epa_per_game': 'home_off_epa',
+        'def_epa_allowed_per_game': 'home_def_epa'
+    }).drop(columns='team')
+
+    # Away-team ratings
+    games = games.merge(
+        epa,
+        left_on=['season', 'away_team'],
+        right_on=['season', 'team'],
+        how='inner'
+    )
+
+    games = games.rename(columns={
+        'off_epa_per_game': 'away_off_epa',
+        'def_epa_allowed_per_game': 'away_def_epa'
+    }).drop(columns='team')
+
+    return games
+
+
+games_train = build_game_training_data(
+    schedules_train,
+    team_epa_train
+)
+# Fit linear regression using home and away epa's
+GAME_FEATURES = [
+    'home_off_epa',
+    'home_def_epa',
+    'away_off_epa',
+    'away_def_epa'
+]
+
+X_game_train = games_train[GAME_FEATURES]
+y_game_train = games_train['point_diff']
+
+game_model = LinearRegression()
+game_model.fit(X_game_train, y_game_train)
+
+# Estimate typical game-margin prediction error
+train_predictions = game_model.predict(X_game_train)
+
+sigma = max(
+    np.std(y_game_train - train_predictions, ddof=1),
+    1.0
+)
+
+print("Game training rows:", len(games_train))
+print("Estimated margin error:", round(sigma, 2), "points")
+
+# IMPORTANT:
+# This first version uses full-season EPA ratings to train the
+# historical game model. Those ratings include information from
+# the games being predicted, so historical accuracy can look
+# better than true out-of-sample accuracy. Rolling/pre-game
+# EPA ratings would be a better next step.
+
+
+# ============================================================
+# 6. BUILD CURRENT 2026 TEAM RATINGS
+# ============================================================
+#calculate EPA from 2026 play by play data
+team_epa_26 = compute_team_epa_per_game(pbp_26)
+
+team_epa_26 = team_epa_26[
+    team_epa_26['season'] == PREDICT_SEASON
+].copy()
+
+# Teams with missing current-season ratings receive the historical
+# average rating as a fallback.
+# This is only a fallback; ideally, all teams have current EPA data.
+historical_avg = team_epa_train[
+    ['off_epa_per_game', 'def_epa_allowed_per_game']
+].mean()
+
+for col in ['off_epa_per_game', 'def_epa_allowed_per_game']:
+    team_epa_26[col] = team_epa_26[col].fillna(historical_avg[col])
+
+team_epa_26 = team_epa_26[
+    [
+        'team', 'off_epa_per_game',
+        'def_epa_allowed_per_game', 'net_epa_per_game'
+    ]
+].drop_duplicates('team')
+
+# Add missing teams, if any, with historical-average ratings
+all_teams = pd.DataFrame({
+    'team': sorted(
+        set(schedules_26['home_team'].dropna()) |
+        set(schedules_26['away_team'].dropna())
+    )
+})
+
+team_epa_26 = all_teams.merge(
+    team_epa_26,
+    on='team',
+    how='left'
+)
+
+for col in ['off_epa_per_game', 'def_epa_allowed_per_game']:
+    team_epa_26[col] = team_epa_26[col].fillna(historical_avg[col])
+
+team_epa_26['net_epa_per_game'] = (
+    team_epa_26['off_epa_per_game'] -
+    team_epa_26['def_epa_allowed_per_game']
+)
+
+# ============================================================
+# 7. 2026 WINS SO FAR
+# ============================================================
+# calc individual win totals so far, merge with every team later
+wins_26 = compute_season_wins(schedules_26)
+wins_26 = wins_26[wins_26['season'] == PREDICT_SEASON]
+
+wins_so_far = (
+    all_teams.merge(
+        wins_26[['team', 'wins']],
+        on='team',
+        how='left'
+    )
+    .rename(columns={'wins': 'wins_so_far'})
+)
+
+wins_so_far['wins_so_far'] = (
+    wins_so_far['wins_so_far'].fillna(0)
+)
+
+# ============================================================
+# 8. PREDICT EACH REMAINING GAME
+# ============================================================
+# identify games without final scores yet
+remaining_games = schedules_26[
+    (schedules_26['season'] == PREDICT_SEASON) &
+    (schedules_26['game_type'] == 'REG') &
+    (
+        schedules_26['home_score'].isna() |
+        schedules_26['away_score'].isna()
+    )
+][['week', 'home_team', 'away_team']].copy()
+
+#retrieve two team ratings
+def simulate_game(home_team, away_team, team_epa, model,
+                  n_sims=N_GAME_SIMS):
+    home_matches = team_epa[team_epa['team'] == home_team]
+    away_matches = team_epa[team_epa['team'] == away_team]
+
+    if home_matches.empty or away_matches.empty:
+        raise ValueError(
+            f"Missing EPA ratings for {home_team} or {away_team}"
+        )
+
+    home = home_matches.iloc[0]
+    away = away_matches.iloc[0]
+#creates one row containing the epa for each teams
+    X = pd.DataFrame([{
+        'home_off_epa': home['off_epa_per_game'],
+        'home_def_epa': home['def_epa_allowed_per_game'],
+        'away_off_epa': away['off_epa_per_game'],
+        'away_def_epa': away['def_epa_allowed_per_game']
+    }])
+
+    # The historical point-differential model already learns
+    # the average home-field effect from home-minus-away margins.
+    # Do not add HFA a second time.
+    expected_margin = float(model.predict(X)[0])
+#sim possible margins, loc setes center of distribution, scale controls how spread out resuls are, size is number of simulated outocmes
+    simulated_margins = rng.normal(
+        loc=expected_margin,
+        scale=sigma,
+        size=n_sims
+    )
+
+    return {
+        'expected_margin': expected_margin,
+        'home_win_prob': np.mean(simulated_margins > 0),
+        'away_win_prob': np.mean(simulated_margins < 0),
+        'median_margin': np.median(simulated_margins),
+        'p10_margin': np.percentile(simulated_margins, 10),
+        'p90_margin': np.percentile(simulated_margins, 90)
+    }
+
+
+game_prob_rows = []
+# apply function for all remaining games
+for _, game in remaining_games.iterrows():
+    result = simulate_game(
+        game['home_team'],
+        game['away_team'],
+        team_epa_26,
+        game_model
+    )
+
+    game_prob_rows.append({
+        'week': game['week'],
+        'home_team': game['home_team'],
+        'away_team': game['away_team'],
+        'expected_margin': result['expected_margin'],
+        'home_win_prob': result['home_win_prob'],
+        'away_win_prob': result['away_win_prob']
+    })
+
+game_probs = pd.DataFrame(game_prob_rows)
+
+print("\nRemaining game probabilities:")
+print(game_probs.to_string(index=False))
+
+# ============================================================
+# 9. EXPECTED FINAL WINS
+# ============================================================
+#For every home team, sum probability of winning each remaining home game
+home_expected = (
+    game_probs.groupby('home_team')['home_win_prob']
+    .sum()
+    .rename_axis('team')
+    .rename('expected_remaining_wins')
+)
+
+away_expected = (
+    game_probs.groupby('away_team')['away_win_prob']
+    .sum()
+    .rename_axis('team')
+    .rename('expected_remaining_wins')
+)
+
+expected_remaining = (
+    pd.concat([home_expected, away_expected])
+    .groupby(level=0)
+    .sum()
+    .reset_index()
+)
+#creates final projected standing table
+final_projection = (
+    wins_so_far.merge(expected_remaining, on='team', how='left')
+)
+
+final_projection['expected_remaining_wins'] = (
+    final_projection['expected_remaining_wins'].fillna(0)
+)
+
+final_projection['projected_wins'] = (
+    final_projection['wins_so_far'] +
+    final_projection['expected_remaining_wins']
+)
+
+print("\n2026 Projected Final Wins:")
+print(
+    final_projection.sort_values(
+        'projected_wins', ascending=False
+    ).to_string(index=False)
+)
+
+# ============================================================
+# 10. NFL DIVISION AND CONFERENCE INFORMATION
+# ============================================================
+
+team_info = pd.DataFrame({
+    'team': [
+        'BUF', 'MIA', 'NE', 'NYJ',
+        'BAL', 'CIN', 'CLE', 'PIT',
+        'HOU', 'IND', 'JAX', 'TEN',
+        'DEN', 'KC', 'LV', 'LAC',
+        'DAL', 'NYG', 'PHI', 'WAS',
+        'CHI', 'DET', 'GB', 'MIN',
+        'ATL', 'CAR', 'NO', 'TB',
+        'ARI', 'LA', 'SF', 'SEA'
+    ],
+    'conference': [
+        'AFC', 'AFC', 'AFC', 'AFC',
+        'AFC', 'AFC', 'AFC', 'AFC',
+        'AFC', 'AFC', 'AFC', 'AFC',
+        'AFC', 'AFC', 'AFC', 'AFC',
+        'NFC', 'NFC', 'NFC', 'NFC',
+        'NFC', 'NFC', 'NFC', 'NFC',
+        'NFC', 'NFC', 'NFC', 'NFC',
+        'NFC', 'NFC', 'NFC', 'NFC'
+    ],
+    'division': [
+        'AFCE', 'AFCE', 'AFCE', 'AFCE',
+        'AFCN', 'AFCN', 'AFCN', 'AFCN',
+        'AFCS', 'AFCS', 'AFCS', 'AFCS',
+        'AFCW', 'AFCW', 'AFCW', 'AFCW',
+        'NFCE', 'NFCE', 'NFCE', 'NFCE',
+        'NFCN', 'NFCN', 'NFCN', 'NFCN',
+        'NFCS', 'NFCS', 'NFCS', 'NFCS',
+        'NFCW', 'NFCW', 'NFCW', 'NFCW'
+    ]
+})
+
+# ============================================================
+# 11. MONTE CARLO SEASON SIMULATIONS
+# ============================================================
+#sim 20,000 possible seasons, start with current wins
+def simulate_seasons(game_probs, wins_so_far, n_sims=N_SEASON_SIMS):
+    teams = wins_so_far['team'].tolist()
+
+    # Each row represents one possible final season
+    win_matrix = pd.DataFrame(
+        np.tile(
+            wins_so_far['wins_so_far'].to_numpy(),
+            (n_sims, 1)
+        ),
+        columns=teams
+    )
+# simulate every remaining game, 1= win
+    for _, game in game_probs.iterrows():
+        home = game['home_team']
+        away = game['away_team']
+        p_home = game['home_win_prob']
+
+        # Simulate this game once per simulated season
+        home_wins = rng.binomial(1, p_home, size=n_sims)
+
+        win_matrix[home] += home_wins
+        win_matrix[away] += 1 - home_wins
+
+    return win_matrix
+
+
+season_sims = simulate_seasons(
+    game_probs,
+    wins_so_far,
+    n_sims=N_SEASON_SIMS
+)
+# calculate average final wins
+expected_wins_mc = season_sims.mean().sort_values(ascending=False)
+
+print("\nMonte Carlo Expected Final Wins:")
+print(expected_wins_mc.to_string())
+
+# Distribution of wins for any team, percentage of amount of wins for certain team
+if 'BAL' in season_sims.columns:
+    print("\nBaltimore Final Win Distribution:")
+    print(
+        season_sims['BAL']
+        .value_counts(normalize=True)
+        .sort_index()
+        .round(4)
+    )
+
+# ============================================================
+# 12. PLAYOFF ODDS
+# ============================================================
+
+def get_playoff_teams(wins_row, team_info):
+    df = pd.DataFrame({
+        'team': wins_row.index,
+        'wins': wins_row.values
+    }).merge(team_info, on='team', how='inner')
+
+    playoff_teams = []
+
+    for conference in ['AFC', 'NFC']:
+        conf_df = df[
+            df['conference'] == conference
+        ].copy()
+
+        # Randomize exact win ties.
+        # This is a simplified tie-breaker, not official NFL rules.
+        conf_df['tie_break'] = rng.random(len(conf_df))
+
+        conf_df = conf_df.sort_values(
+            ['wins', 'tie_break'],
+            ascending=[False, True]
+        )
+
+        # Four division winners
+        division_winners = (
+            conf_df.groupby('division', sort=False)
+            .head(1)
+        )
+
+        playoff_teams.extend(
+            division_winners['team'].tolist()
+        )
+
+        # Three best remaining teams as wild cards
+        remaining = conf_df[
+            ~conf_df['team'].isin(division_winners['team'])
+        ]
+
+        wild_cards = remaining.head(3)
+
+        playoff_teams.extend(wild_cards['team'].tolist())
+
+    return playoff_teams
+
+
+def calculate_playoff_odds(season_sims, team_info):
+    playoff_counts = pd.Series(
+        0, index=season_sims.columns, dtype=float
+    )
+
+    for _, wins_row in season_sims.iterrows():
+        playoff_teams = get_playoff_teams(
+            wins_row, team_info
+        )
+
+        playoff_counts.loc[playoff_teams] += 1
+
+    playoff_odds = playoff_counts / len(season_sims)
+
+    return playoff_odds.sort_values(ascending=False)
+
+
+playoff_odds = calculate_playoff_odds(
+    season_sims,
+    team_info
+)
+
+odds_df = (
+    playoff_odds.rename('playoff_odds')
+    .reset_index()
+    .rename(columns={'index': 'team'})
+    .merge(team_info, on='team', how='left')
+)
+
+odds_df['playoff_odds_pct'] = (
+    odds_df['playoff_odds'] * 100
+)
+
+odds_afc = odds_df[
+    odds_df['conference'] == 'AFC'
+].sort_values('playoff_odds', ascending=False)
+
+odds_nfc = odds_df[
+    odds_df['conference'] == 'NFC'
+].sort_values('playoff_odds', ascending=False)
+
+print("\nAFC Playoff Odds:")
+print(
+    odds_afc[['team', 'playoff_odds_pct']]
+    .to_string(index=False, formatters={
+        'playoff_odds_pct': '{:.1f}%'.format
+    })
+)
+
+print("\nNFC Playoff Odds:")
+print(
+    odds_nfc[['team', 'playoff_odds_pct']]
+    .to_string(index=False, formatters={
+        'playoff_odds_pct': '{:.1f}%'.format
+    })
+)
+
+# ============================================================
+# 13. COMBINED 2026 NFL RESULTS TABLE
+# ============================================================
+
+# Start with original linear model predictions
+linear_df = pd.DataFrame({
+    "team": team_epa_2026["team"].values,
+    "linear_model_wins": predictions_2026
+})
+
+# Game-by-game model: actual wins + expected remaining wins
+game_df = final_projection[
+    ["team", "wins_so_far", "expected_remaining_wins", "projected_wins"]
+].copy()
+
+# Monte Carlo: average final wins across simulated seasons
+mc_df = expected_wins_mc.rename(
+    "monte_carlo_avg_wins"
+).rename_axis("team").reset_index()
+
+# Playoff odds
+playoff_df = playoff_odds.rename(
+    "playoff_odds"
+).rename_axis("team").reset_index()
+
+playoff_df["playoff_odds_pct"] = playoff_df["playoff_odds"] * 100
+
+# Merge all results by team
+combined_results = (
+    game_df
+    .merge(linear_df, on="team", how="left")
+    .merge(mc_df, on="team", how="left")
+    .merge(
+        playoff_df[["team", "playoff_odds_pct"]],
+        on="team",
+        how="left"
+    )
+)
+
+# Sort by Monte Carlo average wins
+combined_results = combined_results.sort_values(
+    "monte_carlo_avg_wins",
+    ascending=False
+)
+
+# Print the complete table
+print("\n========== COMBINED 2026 NFL MODEL RESULTS ==========")
+print(
+    combined_results.round(2).to_string(
+        index=False,
+        formatters={
+            "playoff_odds_pct": lambda x: f"{x:.1f}%"
+            if pd.notna(x) else "Missing"
+        }
+    )
+)
+
+# Optional: save results to a CSV file
+combined_results.to_csv("nfl_2026_combined_results.csv", index=False)
+print("\nSaved to nfl_2026_combined_results.csv")
