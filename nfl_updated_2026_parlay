@@ -1398,6 +1398,363 @@ if skipped_teams:
     for team, qb, reason in skipped_teams:
         print(f"{team} | QB={qb} | {reason}")
 
-#so far look at over if opp def yards play over 6 and positive opp def epa look at fantasy score
-#under 5 yards per play and negative opp def
-#3 lowest opp def epa went under prediction, 3 highest above
+#so far look at over if opp def yards play over 6 and positive opp def epa and positive pass epa look at fantasy score or yards depending on matchup
+    #look at yards if playing against better team, fantasy points if against worst team (Burrow)
+#under 5 yards per play and negative opp def and negative opp pass epa, once again look at matchup or qb, if think they are rushing qb go lower on yards
+#example josh allen vs rams, low pass yards high fantasy points, low defense epa and under 5 yards
+#example Joe Burrow vs dolphins, low pass yards, high fantasy points but high defense epa and over 6 yards
+
+
+
+
+
+# =========================================================
+# QB MATCHUP SIMULATOR: NEAREST HISTORICAL GAMES
+# =========================================================
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.neighbors import NearestNeighbors
+import pandas as pd
+import numpy as np
+
+
+def simulate_qb_matchup(
+    qb_name,
+    team,
+    opponent,
+    is_home=1,
+    n_neighbors=10
+):
+    """
+    Find the closest historical QB games using:
+    - QB's recent performance
+    - Team offensive performance
+    - Team defensive performance
+    - Opponent defensive performance
+    - Home/away context
+
+    Then average the actual stats from the closest games.
+    """
+
+    targets = [
+        "passing_yards",
+        "passing_tds",
+        "interceptions",
+        "rushing_yards",
+        "rushing_tds"
+    ]
+
+    # -----------------------------------------------------
+    # 1. FIND THE QUARTERBACK'S HISTORICAL GAMES
+    # -----------------------------------------------------
+
+    # Search by last name so "Brock Purdy" can match "B.Purdy".
+    last_name = qb_name.strip().split()[-1]
+
+    qb_rows = qb_history[
+        (qb_history["team"] == team) &
+        (qb_history["qb_name"].str.contains(
+            last_name, case=False, na=False
+        ))
+    ].copy()
+
+    if qb_rows.empty:
+        raise ValueError(
+            f"Could not find {qb_name} playing for {team}. "
+            "Check the QB name and team abbreviation."
+        )
+
+    qb_rows = qb_rows.sort_values(
+        ["season", "week", "game_id"]
+    )
+
+    # Use the QB's most recent four qualifying games.
+    recent_qb = qb_rows.tail(4)
+
+    # -----------------------------------------------------
+    # 2. GET RECENT TEAM AND DEFENSIVE RATINGS
+    # -----------------------------------------------------
+
+    def recent_team_games(team_code, home_status=None):
+        rows = team_games[
+            team_games["team"] == team_code
+        ].copy()
+
+        if home_status is not None:
+            rows = rows[rows["is_home"] == home_status]
+
+        rows = rows.sort_values(
+            ["season", "week", "game_id"]
+        )
+
+        return rows.tail(4)
+
+    # Recent overall performance for the QB's team.
+    offense_rows = recent_team_games(team)
+
+    # Recent performance of the opponent's defense.
+    opponent_rows = recent_team_games(opponent)
+
+    if offense_rows.empty:
+        raise ValueError(f"No team-game data found for {team}.")
+
+    if opponent_rows.empty:
+        raise ValueError(
+            f"No team-game data found for {opponent}."
+        )
+
+    # Venue-specific recent form:
+    # If SF is home, Seattle's venue is away.
+    offense_venue = recent_team_games(team, is_home)
+    opponent_venue = recent_team_games(opponent, 1 - is_home)
+
+    # Fall back to all recent games if there is insufficient
+    # venue-specific history.
+    if offense_venue.empty:
+        offense_venue = offense_rows
+
+    if opponent_venue.empty:
+        opponent_venue = opponent_rows
+
+    # -----------------------------------------------------
+    # 3. BUILD THE UPCOMING MATCHUP'S FEATURE VECTOR
+    # -----------------------------------------------------
+
+    X = {}
+
+    # QB recent form.
+    recent_stats = [
+        "attempts",
+        "completions",
+        "passing_yards",
+        "passing_tds",
+        "interceptions",
+        "rushing_attempts",
+        "rushing_yards",
+        "rushing_tds"
+    ]
+
+    for col in recent_stats:
+        X[f"qb_recent_{col}"] = recent_qb[col].mean()
+
+    X["qb_recent_completion_pct"] = (
+        X["qb_recent_completions"] /
+        max(X["qb_recent_attempts"], 1)
+    )
+
+    X["qb_recent_yards_per_attempt"] = (
+        X["qb_recent_passing_yards"] /
+        max(X["qb_recent_attempts"], 1)
+    )
+
+    # Offense and defense ratings from the QB's team.
+    team_feature_map = {
+        "pregame_offensive_epa": "offensive_epa",
+        "pregame_offensive_success": "offensive_success",
+        "pregame_offensive_pass_epa": "offensive_pass_epa",
+        "pregame_offensive_rush_epa": "offensive_rush_epa",
+        "pregame_offensive_yards_per_play":
+            "offensive_yards_per_play",
+
+        "pregame_def_epa_allowed": "def_epa_allowed",
+        "pregame_def_success_allowed": "def_success_allowed",
+        "pregame_def_pass_epa_allowed":
+            "def_pass_epa_allowed",
+        "pregame_def_rush_epa_allowed":
+            "def_rush_epa_allowed",
+        "pregame_def_yards_per_play_allowed":
+            "def_yards_per_play_allowed"
+    }
+
+    for feature, source_col in team_feature_map.items():
+        X[feature] = offense_rows[source_col].mean()
+
+    # The opponent's defensive ratings.
+    opponent_feature_map = {
+        "opp_pregame_def_epa_allowed": "def_epa_allowed",
+        "opp_pregame_def_success_allowed": "def_success_allowed",
+        "opp_pregame_def_pass_epa_allowed":
+            "def_pass_epa_allowed",
+        "opp_pregame_def_rush_epa_allowed":
+            "def_rush_epa_allowed",
+        "opp_pregame_def_yards_per_play_allowed":
+            "def_yards_per_play_allowed"
+    }
+
+    for feature, source_col in opponent_feature_map.items():
+        X[feature] = opponent_rows[source_col].mean()
+
+    # Home/away flag.
+    X["is_home"] = int(is_home)
+
+    # Venue-specific ratings for the QB's team.
+    venue_team_map = {
+        "pregame_home_away_offensive_epa": "offensive_epa",
+        "pregame_home_away_offensive_pass_epa":
+            "offensive_pass_epa",
+        "pregame_home_away_offensive_rush_epa":
+            "offensive_rush_epa",
+        "pregame_home_away_def_epa_allowed":
+            "def_epa_allowed",
+        "pregame_home_away_def_pass_epa_allowed":
+            "def_pass_epa_allowed",
+        "pregame_home_away_def_rush_epa_allowed":
+            "def_rush_epa_allowed"
+    }
+
+    for feature, source_col in venue_team_map.items():
+        X[feature] = offense_venue[source_col].mean()
+
+    # Venue-specific ratings for the opponent's defense.
+    venue_opp_map = {
+        "opp_pregame_home_away_def_epa_allowed":
+            "def_epa_allowed",
+        "opp_pregame_home_away_def_pass_epa_allowed":
+            "def_pass_epa_allowed",
+        "opp_pregame_home_away_def_rush_epa_allowed":
+            "def_rush_epa_allowed"
+    }
+
+    for feature, source_col in venue_opp_map.items():
+        X[feature] = opponent_venue[source_col].mean()
+
+    # Keep features in the exact order used for model_data.
+    query = pd.DataFrame([X]).reindex(columns=feature_cols)
+
+    # Handle any missing features.
+    training_medians = model_data[feature_cols].median()
+    query = query.fillna(training_medians)
+
+    if query.isna().any().any():
+        raise ValueError(
+            "Some matchup features are missing from the "
+            "historical training data."
+        )
+
+    # -----------------------------------------------------
+    # 4. FIND THE 10 CLOSEST HISTORICAL MATCHUPS
+    # -----------------------------------------------------
+
+    historical = model_data.dropna(
+        subset=feature_cols + targets
+    ).copy()
+
+    # Keep the comparison games from before the most recent
+    # season/week represented in the QB history. This helps
+    # avoid using the latest same-week results as comparisons.
+    latest_game = qb_rows.iloc[-1]
+
+    historical = historical[
+        (historical["season"] < latest_game["season"]) |
+        (
+            (historical["season"] == latest_game["season"]) &
+            (historical["week"] < latest_game["week"])
+        )
+    ].copy()
+
+    if historical.empty:
+        raise ValueError(
+            "No earlier historical games are available "
+            "for comparison."
+        )
+
+    # Standardize features so yards, EPA, percentages, etc.
+    # are measured on comparable scales.
+    scaler = StandardScaler()
+
+    X_historical = scaler.fit_transform(
+        historical[feature_cols]
+    )
+
+    X_query = scaler.transform(query[feature_cols])
+
+    k = min(n_neighbors, len(historical))
+
+    neighbors = NearestNeighbors(
+        n_neighbors=k,
+        metric="euclidean"
+    )
+
+    neighbors.fit(X_historical)
+
+    distances, indices = neighbors.kneighbors(X_query)
+
+    comps = historical.iloc[indices[0]].copy()
+    comps["similarity_distance"] = distances[0]
+
+    # -----------------------------------------------------
+    # 5. DISPLAY THE COMPARABLE GAMES
+    # -----------------------------------------------------
+
+    display_cols = [
+        "season",
+        "week",
+        "qb_name",
+        "team",
+        "opponent",
+        "passing_yards",
+        "passing_tds",
+        "interceptions",
+        "rushing_yards",
+        "rushing_tds",
+        "similarity_distance"
+    ]
+
+    comps = comps.sort_values(
+        "similarity_distance"
+    ).reset_index(drop=True)
+
+    print("\n" + "=" * 85)
+    print(f"QB MATCHUP SIMULATOR: {qb_name}")
+    print(f"Matchup: {team} vs. {opponent}")
+    print(f"Venue: {'Home' if is_home else 'Away'}")
+    print(f"Historical comparisons: {len(comps)}")
+    print("=" * 85)
+
+    print("\nCLOSEST HISTORICAL GAMES")
+
+    print(
+        comps[display_cols]
+        .round(2)
+        .to_string(index=False)
+    )
+
+    # -----------------------------------------------------
+    # 6. CALCULATE THE COMPS-BASED PROJECTED STATLINE
+    # -----------------------------------------------------
+
+    projection = comps[targets].mean()
+
+    print("\nAVERAGE STATLINE FROM COMPARABLE GAMES")
+
+    print(projection.round(2).to_string())
+
+    # Save the comparable games and their averages.
+    comps[display_cols].to_csv(
+        "qb_matchup_comparable_games.csv",
+        index=False
+    )
+
+    projection.rename("Projected average").to_csv(
+        "qb_matchup_projected_statline.csv",
+        header=True
+    )
+
+    print("\nSaved:")
+    print("- qb_matchup_comparable_games.csv")
+    print("- qb_matchup_projected_statline.csv")
+
+    return comps, projection
+
+
+# =========================================================
+# RUN THE SIMULATOR: BROCK PURDY VS. SEATTLE
+# =========================================================
+
+purdy_comps, purdy_projection = simulate_qb_matchup(
+    qb_name="Josh Allen",
+    team="BUF",
+    opponent="LA",
+    is_home=0,
+    n_neighbors=30
+)
