@@ -611,14 +611,17 @@ def simulate_game(home_team, away_team, team_features, model,
         size=n_sims
     )
 
+   
     return {
         "expected_margin": expected_margin,
         "home_win_prob": np.mean(simulated_margins > 0),
         "away_win_prob": np.mean(simulated_margins < 0),
         "median_margin": np.median(simulated_margins),
         "p10_margin": np.percentile(simulated_margins, 10),
-        "p90_margin": np.percentile(simulated_margins, 90)
+        "p90_margin": np.percentile(simulated_margins, 90),
+        "simulated_margins": simulated_margins
     }
+
 
 #setup helper function 
 
@@ -729,9 +732,13 @@ print("Seattle win probability:", seattle_home["home_win_prob"])
 
 print("Teams with current game statistics:", len(team_features_26))
 
+
+# Store summary results and individual simulations
 game_prob_rows = []
+all_simulations = []
 
 for _, game in remaining_games.iterrows():
+
     result = simulate_game(
         game["home_team"],
         game["away_team"],
@@ -739,19 +746,57 @@ for _, game in remaining_games.iterrows():
         game_model
     )
 
+    # Save the summary for this matchup
     game_prob_rows.append({
         "week": game["week"],
         "home_team": game["home_team"],
         "away_team": game["away_team"],
         "expected_margin": result["expected_margin"],
         "home_win_prob": result["home_win_prob"],
-        "away_win_prob": result["away_win_prob"]
+        "away_win_prob": result["away_win_prob"],
+        "median_margin": result["median_margin"],
+        "p10_margin": result["p10_margin"],
+        "p90_margin": result["p90_margin"]
     })
 
+    # Save all 20,000 simulated outcomes for this matchup
+    for sim_num, margin in enumerate(
+        result["simulated_margins"], start=1
+    ):
+        all_simulations.append({
+            "week": game["week"],
+            "home_team": game["home_team"],
+            "away_team": game["away_team"],
+            "simulation": sim_num,
+            "simulated_home_margin": margin,
+            "home_win": int(margin > 0),
+            "away_win": int(margin < 0)
+        })
+
+# Create the summary DataFrame
 game_probs = pd.DataFrame(game_prob_rows)
+
+# Create the individual simulation DataFrame
+simulation_details = pd.DataFrame(all_simulations)
+
+# Save both CSV files
+game_probs.to_csv(
+    "nfl_2026_remaining_game_simulations.csv",
+    index=False
+)
+
+simulation_details.to_csv(
+    "nfl_2026_individual_game_simulations.csv",
+    index=False
+)
 
 print("\nRemaining game probabilities:")
 print(game_probs.to_string(index=False))
+
+print("\nSaved matchup summaries to nfl_2026_remaining_game_simulations.csv")
+print("Saved individual outcomes to nfl_2026_individual_game_simulations.csv")
+print("Total individual simulations:", len(simulation_details))
+
 
 # ============================================================
 # 9. EXPECTED FINAL WINS
